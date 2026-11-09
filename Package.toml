@@ -1,7 +1,7 @@
 [meta]
     title =                 "NanosDI"
     author =                "DasDarki"
-    version =               "0.1.0"
+    version =               "0.1.1"
 
 [script]
     force_no_map_package =  false

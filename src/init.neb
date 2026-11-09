@@ -1,2 +1,0 @@
-export { service, register, provide, get, onReady, isReady, unresolved } from "./Shared/Container"
-export { Service } from "./Shared/Service"
