@@ -1,0 +1,30 @@
+generate_declarations = false
+annotations = ["annotations"]
+runtime_global = "NanosDI"
+runtime_export = "Package.Export(%name, %value)"
+output = "out"
+target = "5.4"
+name = "nanos-di"
+source = "src"
+version = "0.1.0"
+
+[assets]
+"Package.toml" = "Package.toml"
+
+[dependencies]
+nanos-world-types = "github:nebra-lang/nanos-world-types"
+
+[sides]
+"src/Shared/**" = ["shared"]
+
+[code]
+index_base = 1
+import_statement = "Package.Require(%s)"
+import_extension = ".lua"
+import_path = "root"
+
+[rules]
+strict_nil = true
+
+[reflection]
+mode = "none"

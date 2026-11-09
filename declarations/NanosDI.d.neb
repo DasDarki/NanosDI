@@ -1,0 +1,11 @@
+declare interface NanosDIStatic
+  unresolved: any
+  function service(name: string, injections: { [string]: string }?): any
+  function register(name: string, serviceClass: any, injections: { [string]: string }?, isAbstract: boolean?): any
+  function provide(name: string, instance: any): any
+  function get(target: any): any
+  function onReady(callback: () -> void): nil
+  function isReady(): boolean
+end
+
+declare NanosDI: NanosDIStatic

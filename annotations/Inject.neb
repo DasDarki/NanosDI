@@ -1,0 +1,10 @@
+export local annotation = {
+    targets = { "ClassField" },
+    params = {
+        name = { type = "string", required = false }
+    }
+}
+
+export function apply(target, args)
+    error("@Inject on the field '" .. target.name.name .. "' needs @Service on its class")
+end

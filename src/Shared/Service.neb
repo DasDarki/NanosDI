@@ -1,0 +1,7 @@
+export abstract class Service
+  function OnStart(): void
+  end
+
+  function OnStop(): void
+  end
+end

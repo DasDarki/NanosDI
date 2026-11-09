@@ -1,0 +1,94 @@
+export local annotation = {
+    targets = { "Class" },
+    params = {
+        name = { type = "string", required = false }
+    }
+}
+
+local function explicitName(injectAnnotation)
+    for _, argument in ipairs(injectAnnotation.args or {}) do
+        local value = argument.value
+        if value == nil or value.__kind ~= "StringLiteralExpr" then
+            error("@Inject only takes a string name")
+        end
+
+        return value.value
+    end
+
+    return nil
+end
+
+local function typeNameOf(typeRef)
+    if typeRef ~= nil and typeRef.__kind == "NamedTypeRef" then
+        return typeRef.name.name
+    end
+
+    return nil
+end
+
+local function injectionOf(className, field, injectAnnotation)
+    local fieldLabel = "'" .. className .. "." .. field.name.name .. "'"
+    if field.isStatic then
+        error("The static field " .. fieldLabel .. " cannot be injected")
+    end
+
+    if field.defaultValue ~= nil then
+        error("The injected field " .. fieldLabel .. " cannot have a default value")
+    end
+
+    local typeRef = field.typeAnnotation
+    local optional = false
+    if typeRef ~= nil and typeRef.__kind == "NullableTypeRef" then
+        optional = true
+        typeRef = typeRef.innerType
+    end
+
+    local typeName = explicitName(injectAnnotation) or typeNameOf(typeRef)
+    if typeName == nil then
+        error("The injected field " .. fieldLabel .. " has to be typed with a class or interface, or name one with @Inject(name = \"...\")")
+    end
+
+    return optional and typeName .. "?" or typeName
+end
+
+local function extractInjections(target)
+    local className = target.name.name
+    local injections = {}
+    for _, field in ipairs(target.fields or {}) do
+        local remaining = {}
+        for _, annotationNode in ipairs(field.annotations or {}) do
+            if annotationNode.name.name == "Inject" then
+                local specification = injectionOf(className, field, annotationNode)
+                injections[#injections + 1] = { key = field.name.name, value = ir.stringLiteral(specification) }
+                field.defaultValue = ir.dotAccess(ir.nameExpr("NanosDI"), "unresolved")
+            else
+                remaining[#remaining + 1] = annotationNode
+            end
+        end
+
+        field.annotations = remaining
+    end
+
+    return injections
+end
+
+local function assertCreatableWithoutArguments(target)
+    for _, classConstructor in ipairs(target.constructors or {}) do
+        local parameters = classConstructor.parameters or classConstructor.params or {}
+        if #parameters > 0 then
+            error("The service '" .. target.name.name .. "' is created by the container, so its constructor cannot take parameters")
+        end
+    end
+end
+
+export function apply(target, args)
+    local className = target.name.name
+    assertCreatableWithoutArguments(target)
+    local registerCall = ir.call(ir.dotAccess(ir.nameExpr("NanosDI"), "register"), {
+        ir.stringLiteral(args.name or className),
+        ir.nameExpr(className),
+        ir.table(extractInjections(target)),
+        ir.boolLiteral(target.isAbstract == true)
+    })
+    return { target, ir.exprStmt(registerCall) }
+end

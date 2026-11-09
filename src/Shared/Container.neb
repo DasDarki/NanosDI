@@ -1,0 +1,368 @@
+import { getCallingPackage } from "./PackageScope"
+
+local LOG_PREFIX = "[nanos-di] "
+local OPTIONAL_SUFFIX = "?"
+local NO_INJECTIONS: { [string]: string } = {}
+
+class ServiceEntry
+  name: string
+  origin: string?
+  serviceClass: any = nil
+  instance: any = nil
+  retiredInstance: any = nil
+  lifecycle: string = "pending"
+
+  constructor(name: string, origin: string?)
+    self.name = name
+    self.origin = origin
+  end
+end
+
+local entries: ServiceEntry[] = {}
+local entriesByName: { [string]: ServiceEntry } = {}
+local bindings: { [string]: ServiceEntry[] } = {}
+local injectionsByClass: { [any]: { [string]: string } } = {}
+local namesByClass: { [any]: string } = {}
+local readyCallbacks: (() -> void)[] = {}
+local mut startOrder: ServiceEntry[] = {}
+local mut packagesLoaded = false
+local mut resolved = false
+local mut refreshScheduled = false
+
+export local unresolved: any = nil
+
+local function sortedKeys(values: { [string]: any }): string[]
+  local keys: string[] = {}
+  for key, _ in pairs(values) do
+    table.insert(keys, key)
+  end
+
+  table.sort(keys)
+  return keys
+end
+
+local function parentOf(serviceClass: any): any
+  local metatable: any = getmetatable(serviceClass)
+  if type(metatable) == "table" and type(metatable.__index) == "table" then
+    return metatable.__index
+  end
+
+  return nil
+end
+
+local function collectInjections(serviceClass: any): { [string]: string }
+  local collected: { [string]: string } = {}
+  local mut current: any = serviceClass
+  while current ~= nil do
+    for field, typeName in pairs(injectionsByClass[current] ?? {}) do
+      if collected[field] == nil then
+        collected[field] = typeName
+      end
+    end
+
+    current = parentOf(current)
+  end
+
+  return collected
+end
+
+local function collectInterfaces(serviceClass: any): string[]
+  local seen: { [string]: boolean } = {}
+  local mut current: any = serviceClass
+  while current ~= nil do
+    local declared: any = rawget(current, "__interfaces")
+    if type(declared) == "table" then
+      for interfaceName, _ in pairs(declared) do
+        seen[interfaceName] = true
+      end
+    end
+
+    current = parentOf(current)
+  end
+
+  return sortedKeys(seen)
+end
+
+local function parseInjection(specification: string): (string, boolean)
+  if string.sub(specification, -1) == OPTIONAL_SUFFIX then
+    return string.sub(specification, 1, -2), true
+  end
+
+  return specification, false
+end
+
+local function bind(bindingName: string, entry: ServiceEntry): void
+  local bound = bindings[bindingName]
+  if bound == nil then
+    bindings[bindingName] = { entry }
+    return
+  end
+
+  for _, existing in ipairs(bound) do
+    if existing == entry then
+      return
+    end
+  end
+
+  table.insert(bound, entry)
+end
+
+local function describeOrigin(origin: string?): string
+  return origin ~= nil and "package '" .. origin .. "'" or "this package"
+end
+
+local function claimEntry(name: string, origin: string?): ServiceEntry
+  local existing = entriesByName[name]
+  if existing == nil then
+    local created = new ServiceEntry(name, origin)
+    entriesByName[name] = created
+    table.insert(entries, created)
+    bind(name, created)
+    return created
+  end
+
+  if not packagesLoaded or existing.origin ~= origin then
+    error(LOG_PREFIX .. "the service '" .. name .. "' is registered twice, by " .. describeOrigin(existing.origin) .. " and " .. describeOrigin(origin) .. ". Give one of them another name with @Service(name = \"...\")", 0)
+  end
+
+  if existing.lifecycle == "running" then
+    existing.retiredInstance = existing.instance
+  end
+
+  existing.instance = nil
+  existing.lifecycle = "pending"
+  return existing
+end
+
+local function findProvider(typeName: string): (ServiceEntry?, string?)
+  local bound = bindings[typeName]
+  if bound == nil then
+    return nil, "no service provides '" .. typeName .. "'"
+  end
+
+  if #bound > 1 then
+    local names: string[] = {}
+    for _, entry in ipairs(bound) do
+      table.insert(names, entry.name)
+    end
+
+    return nil, "'" .. typeName .. "' is provided by more than one service (" .. table.concat(names, ", ") .. "), inject one of them by its class"
+  end
+
+  return bound[1], nil
+end
+
+local function findProblems(): string[]
+  local problems: string[] = {}
+  for _, entry in ipairs(entries) do
+    if entry.serviceClass ~= nil then
+      local injections = collectInjections(entry.serviceClass)
+      for _, field in ipairs(sortedKeys(injections)) do
+        local typeName, optional = parseInjection(injections[field])
+        local provider, problem = findProvider(typeName)
+        if provider == nil and (not optional or bindings[typeName] ~= nil) then
+          table.insert(problems, entry.name .. "." .. field .. ": " .. tostring(problem))
+        end
+      end
+    end
+  end
+
+  return problems
+end
+
+local function runHook(serviceName: string, instance: any, hook: string): boolean
+  local handler: any = instance[hook]
+  if handler == nil then
+    return true
+  end
+
+  local ok, failure = pcall(handler, instance)
+  if not ok then
+    Console.Error("%s", LOG_PREFIX .. hook .. " of the service '" .. serviceName .. "' failed: " .. tostring(failure))
+  end
+
+  return ok
+end
+
+local function createInstances(): void
+  for _, entry in ipairs(entries) do
+    if entry.serviceClass ~= nil and entry.instance == nil then
+      local ok, instance = pcall(entry.serviceClass.new)
+      if not ok then
+        error(LOG_PREFIX .. "the service '" .. entry.name .. "' could not be created: " .. tostring(instance), 0)
+      end
+
+      entry.instance = instance
+    end
+  end
+end
+
+local function injectInstances(): void
+  for _, entry in ipairs(entries) do
+    if entry.serviceClass ~= nil then
+      for field, specification in pairs(collectInjections(entry.serviceClass)) do
+        local typeName, _ = parseInjection(specification)
+        local provider, _ = findProvider(typeName)
+        entry.instance[field] = provider ~= nil and provider.instance or nil
+      end
+    end
+  end
+end
+
+local function visitDependencies(entry: ServiceEntry, visited: { [any]: boolean }, order: ServiceEntry[]): void
+  if visited[entry] or entry.serviceClass == nil then
+    return
+  end
+
+  visited[entry] = true
+  local injections = collectInjections(entry.serviceClass)
+  for _, field in ipairs(sortedKeys(injections)) do
+    local typeName, _ = parseInjection(injections[field])
+    local provider, _ = findProvider(typeName)
+    if provider ~= nil then
+      visitDependencies(provider, visited, order)
+    end
+  end
+
+  table.insert(order, entry)
+end
+
+local function startServices(): void
+  local order: ServiceEntry[] = {}
+  local visited: { [any]: boolean } = {}
+  for _, entry in ipairs(entries) do
+    visitDependencies(entry, visited, order)
+  end
+
+  startOrder = order
+  for _, entry in ipairs(order) do
+    if entry.lifecycle == "pending" then
+      entry.lifecycle = runHook(entry.name, entry.instance, "OnStart") and "running" or "failed"
+    end
+  end
+end
+
+local function stopRetiredInstances(): void
+  for _, entry in ipairs(entries) do
+    if entry.retiredInstance ~= nil then
+      runHook(entry.name, entry.retiredInstance, "OnStop")
+      entry.retiredInstance = nil
+    end
+  end
+end
+
+local function flushReadyCallbacks(): void
+  while #readyCallbacks > 0 do
+    local callback = table.remove(readyCallbacks, 1)
+    callback()
+  end
+end
+
+local function resolveAll(): void
+  local problems = findProblems()
+  if #problems > 0 then
+    error(LOG_PREFIX .. "the services cannot be resolved:\n  " .. table.concat(problems, "\n  "), 0)
+  end
+
+  stopRetiredInstances()
+  createInstances()
+  injectInstances()
+  resolved = true
+  startServices()
+  flushReadyCallbacks()
+end
+
+local function scheduleRefresh(): void
+  if not packagesLoaded or refreshScheduled then
+    return
+  end
+
+  refreshScheduled = true
+  Timer.SetTimeout(function(): void
+    refreshScheduled = false
+    resolveAll()
+  end, 0)
+end
+
+local function stopServices(): void
+  for index = #startOrder, 1, -1 do
+    local entry = startOrder[index]
+    if entry.lifecycle == "running" then
+      runHook(entry.name, entry.instance, "OnStop")
+      entry.lifecycle = "stopped"
+    end
+  end
+end
+
+export function register(name: string, serviceClass: any, injections: { [string]: string }?, isAbstract: boolean?): any
+  injectionsByClass[serviceClass] = injections ?? NO_INJECTIONS
+  namesByClass[serviceClass] = name
+  if isAbstract then
+    return serviceClass
+  end
+
+  local entry = claimEntry(name, getCallingPackage())
+  entry.serviceClass = serviceClass
+  for _, interfaceName in ipairs(collectInterfaces(serviceClass)) do
+    bind(interfaceName, entry)
+  end
+
+  scheduleRefresh()
+  return serviceClass
+end
+
+export function service(name: string, injections: { [string]: string }?): any
+  local serviceClass: any = {}
+  serviceClass.__index = serviceClass
+  serviceClass.__name = name
+  serviceClass.new = function(): any
+    return setmetatable({}, serviceClass)
+  end
+
+  return register(name, serviceClass, injections, false)
+end
+
+export function provide(name: string, instance: any): any
+  local entry = claimEntry(name, getCallingPackage())
+  entry.serviceClass = nil
+  entry.instance = instance
+  entry.lifecycle = "provided"
+  scheduleRefresh()
+  return instance
+end
+
+export function get(target: any): any
+  if not resolved then
+    error(LOG_PREFIX .. "the services are not resolved yet, use NanosDI.onReady or a service's OnStart", 2)
+  end
+
+  local typeName: string = type(target) == "string" and target or namesByClass[target]
+  if typeName == nil then
+    error(LOG_PREFIX .. "the class passed to NanosDI.get is not a registered service", 2)
+  end
+
+  local provider, problem = findProvider(typeName)
+  if provider == nil then
+    error(LOG_PREFIX .. tostring(problem), 2)
+  end
+
+  return provider.instance
+end
+
+export function onReady(callback: () -> void): void
+  table.insert(readyCallbacks, callback)
+  if resolved then
+    flushReadyCallbacks()
+  end
+end
+
+export function isReady(): boolean
+  return resolved
+end
+
+Package.Subscribe("Load", function(): void
+  packagesLoaded = true
+  resolveAll()
+end)
+
+Package.Subscribe("Unload", stopServices)
